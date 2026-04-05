@@ -31,6 +31,12 @@ export interface MessengerQuickReply {
   payload: string;
 }
 
+export interface MessengerOutgoingQuickReply {
+  content_type: "text";
+  payload: string;
+  title: string;
+}
+
 export interface MessengerMessagePayload {
   attachments?: MessengerAttachment[];
   is_echo?: boolean;

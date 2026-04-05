@@ -12,6 +12,9 @@ import type {
   Adapter,
   AdapterPostableMessage,
   Attachment,
+  ButtonElement,
+  CardChild,
+  CardElement,
   ChannelInfo,
   ChatInstance,
   EmojiValue,
@@ -34,6 +37,7 @@ import type {
   MessengerAdapterConfig,
   MessengerMessagingEvent,
   MessengerRawMessage,
+  MessengerOutgoingQuickReply,
   MessengerSendApiResponse,
   MessengerThreadId,
   MessengerUserProfile,
@@ -43,7 +47,10 @@ import type {
 const GRAPH_API_BASE = "https://graph.facebook.com";
 const DEFAULT_API_VERSION = "v21.0";
 const MESSENGER_MESSAGE_LIMIT = 2000;
+const MESSENGER_QUICK_REPLY_LIMIT = 13;
+const MESSENGER_QUICK_REPLY_TITLE_LIMIT = 20;
 const MESSAGE_SEQUENCE_PATTERN = /:(\d+)$/;
+const QUICK_REPLY_PAYLOAD_TAG = "chat-sdk-button";
 
 export class MessengerAdapter implements Adapter<
   MessengerThreadId,
@@ -241,6 +248,31 @@ export class MessengerAdapter implements Adapter<
     const parsedMessage = this.parseMessengerMessage(event, threadId);
     this.cacheMessage(parsedMessage);
 
+    const quickReplyPayload = event.message?.quick_reply?.payload;
+    if (quickReplyPayload) {
+      const action = this.decodeQuickReplyPayload(quickReplyPayload);
+
+      this.chat.processAction(
+        {
+          adapter: this,
+          actionId: action.actionId,
+          value: action.value,
+          messageId: event.message?.mid ?? `quick_reply:${event.timestamp}`,
+          threadId,
+          user: {
+            userId: event.sender.id,
+            userName: event.sender.id,
+            fullName: event.sender.id,
+            isBot: false,
+            isMe: false,
+          },
+          raw: event,
+        },
+        options,
+      );
+      return;
+    }
+
     this.chat.processMessage(this, threadId, parsedMessage, options);
   }
 
@@ -331,6 +363,9 @@ export class MessengerAdapter implements Adapter<
     const { recipientId } = this.resolveThreadId(threadId);
 
     const card = extractCard(message);
+    const quickReplies = card
+      ? this.buildQuickRepliesFromCard(card)
+      : undefined;
     const text = this.truncateMessage(
       convertEmojiPlaceholders(
         card
@@ -349,7 +384,12 @@ export class MessengerAdapter implements Adapter<
       "POST",
       {
         recipient: { id: recipientId },
-        message: { text },
+        message: {
+          text,
+          ...(quickReplies && quickReplies.length > 0
+            ? { quick_replies: quickReplies }
+            : {}),
+        },
         messaging_type: "RESPONSE",
       },
     );
@@ -642,6 +682,83 @@ export class MessengerAdapter implements Adapter<
     }
 
     return `${text.slice(0, MESSENGER_MESSAGE_LIMIT - 3)}...`;
+  }
+
+  private truncateQuickReplyTitle(title: string): string {
+    if (title.length <= MESSENGER_QUICK_REPLY_TITLE_LIMIT) {
+      return title;
+    }
+
+    return `${title.slice(0, MESSENGER_QUICK_REPLY_TITLE_LIMIT - 3)}...`;
+  }
+
+  private buildQuickRepliesFromCard(
+    card: CardElement,
+  ): MessengerOutgoingQuickReply[] {
+    const buttons = this.collectButtons(card.children);
+    return buttons.slice(0, MESSENGER_QUICK_REPLY_LIMIT).map((button) => ({
+      content_type: "text" as const,
+      title: this.truncateQuickReplyTitle(button.label),
+      payload: this.encodeQuickReplyPayload(button),
+    }));
+  }
+
+  private collectButtons(children: CardChild[]): ButtonElement[] {
+    const buttons: ButtonElement[] = [];
+
+    for (const child of children) {
+      if (child.type === "actions") {
+        for (const actionChild of child.children) {
+          if (actionChild.type === "button" && !actionChild.disabled) {
+            buttons.push(actionChild);
+          }
+        }
+      }
+
+      if (child.type === "section") {
+        buttons.push(...this.collectButtons(child.children));
+      }
+    }
+
+    return buttons;
+  }
+
+  private encodeQuickReplyPayload(button: ButtonElement): string {
+    return JSON.stringify({
+      source: QUICK_REPLY_PAYLOAD_TAG,
+      actionId: button.id,
+      value: button.value,
+    });
+  }
+
+  private decodeQuickReplyPayload(payload: string): {
+    actionId: string;
+    value?: string;
+  } {
+    try {
+      const parsed = JSON.parse(payload) as {
+        source?: string;
+        actionId?: string;
+        value?: string;
+      };
+
+      if (
+        parsed.source === QUICK_REPLY_PAYLOAD_TAG &&
+        typeof parsed.actionId === "string"
+      ) {
+        return {
+          actionId: parsed.actionId,
+          value: typeof parsed.value === "string" ? parsed.value : undefined,
+        };
+      }
+    } catch {
+      // Fallback to legacy payload handling when payload is not JSON.
+    }
+
+    return {
+      actionId: payload,
+      value: payload,
+    };
   }
 
   private paginateMessages(
